@@ -24,7 +24,7 @@ import logging
 import time
 from typing import Any, Iterator
 
-from .common import JsonClient, OddsRow, canonical_sport, utc_now_iso, write_csv
+from .common import CompetitionFilter, JsonClient, OddsRow, accept_all, canonical_sport, utc_now_iso, write_csv
 
 log = logging.getLogger(__name__)
 
@@ -238,3 +238,36 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def fetch(
+    sport: str,
+    competition_filter: CompetitionFilter = accept_all,
+    client: UnibetClient | None = None,
+    paths: dict[str, list[str]] | None = None,
+) -> list[OddsRow]:
+    """Uniform entry point used by scrapers.registry.
+
+    Unibet's sport-wide soccer view is truncated, so soccer needs explicit
+    league paths ({label: [filter paths]}). Tennis reads the sport-wide view and
+    labels each event from its path (e.g. "ATP Shanghai", "Challenger Jinan")."""
+    client = client or UnibetClient(delay=0.5)
+    rows: list[OddsRow] = []
+    if paths:
+        for label, ps in paths.items():
+            for row in scrape(ps, client=client):
+                row.league = label
+                rows.append(row)
+        return rows
+
+    view = client.matches_view({"soccer": "football", "tennis": "tennis"}[sport])
+    scraped_at = utc_now_iso()
+    for entry in _iter_events(view):
+        path = entry["event"].get("path") or []
+        label = competition_filter(" ".join(p["englishName"] for p in path[1:]), None)
+        if not label:
+            continue
+        for row in _rows_from_event(entry, scraped_at):
+            row.league = label
+            rows.append(row)
+    return rows

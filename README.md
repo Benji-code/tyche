@@ -1,99 +1,78 @@
 # tyche
 
-Positive-EV betting finder: compare soft-book prices against sharp references (Pinnacle / Betfair).
+Positive-EV betting finder: compare Australian soft-book prices against sharp references (Pinnacle, Betfair Exchange), confirm with a "wisdom of the crowd" model, size with fractional Kelly, and log every recommendation so strategies can be judged later.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+source .venv/bin/activate        # or prefix commands with .venv/bin/
 ```
 
-## Scrapers
-
-All scrapers write the same long-format CSV (one row per outcome, schema in `scrapers/common.py`).
-Group by `(bookmaker, event_id, market_id)` to get a complete market for devigging.
-
-### Unibet AU
-
-Uses the JSON feed behind unibet.com.au (Kambi platform), no HTML parsing.
+## Run
 
 ```bash
-.venv/bin/python -m scrapers.unibet --list-sports
-.venv/bin/python -m scrapers.unibet --list-leagues basketball
-.venv/bin/python -m scrapers.unibet basketball/nba football/england/premier_league
-.venv/bin/python -m scrapers.unibet australian_rules --all-markets --prematch-only -o data/afl.csv
+python -m soccer.run             # 15 European leagues, all books (~1 min)
+python -m tennis.run             # ATP, WTA, Challenger, WTA 125 match winner (~15 s)
 ```
 
-- By default fetches the main markets (head-to-head, line/spread, totals). `--all-markets` fetches every category.
-- Sport-wide paths (e.g. `football`) return a truncated event list; use league paths for full coverage.
-- `odds_decimal` and `line` are already converted from Kambi's integer thousandths.
+Each run prints book status, cross-book matching coverage, unmapped names (as paste-ready dictionary lines), **good bets** with half-Kelly stakes on $100, the +EV prices that were rejected and why, and soft-book arbs. Good bets, arbs and a run summary are appended to `soccer/logs/` or `tennis/logs/`.
 
-### Ladbrokes AU / Neds
+Useful flags (both sports): `--min-sharps 1` (allow bets when only Pinnacle or Betfair prices the market), `--min-ev 0.03`, `--bankroll 500 --kelly 0.25`, `--books pinnacle betfair sportsbet ...`, `--save` (keep raw prices in `data/`), `--no-log`. Soccer: `--leagues ...`, `--from-dir data/soccer/<ts>`. Tennis: `--tours ATP WTA`, `--from-csv data/tennis/<ts>.csv`. `--help` lists everything.
 
-Same Entain backend for both brands (identical event ids and, so far, identical prices), so `--brand` just picks the host.
+## What counts as a good bet (`engine/evaluate.py`)
 
-```bash
-.venv/bin/python -m scrapers.ladbrokes --list-sports
-.venv/bin/python -m scrapers.ladbrokes --list-competitions soccer
-.venv/bin/python -m scrapers.ladbrokes basketball                                   # main market only, 1 request per sport
-.venv/bin/python -m scrapers.ladbrokes basketball -c NBA --event-cards --core-only  # H2H + line + total per game
-.venv/bin/python -m scrapers.ladbrokes soccer -c "Premier League" --brand neds --event-cards
+Risk-neutral to slightly risk-averse: every bet is judged and sized on a **pessimistic** fair probability, because we only bet where our estimate looks best (the winner's curse inflates estimated edges).
+
+For each outcome, every available fair-probability estimate is collected:
+- **Pinnacle** with its margin removed three ways (multiplicative, power, Shin), if its margin is ≤ 10%;
+- **Betfair** back/lay midpoint, if ≥ $1,000 is matched and the spread is ≤ 10%;
+- **Crowd**: the sharp price predicted from the *other* soft books (`engine/crowd.py`: median of their margin-free prices, mapped to a sharp probability by a logistic calibration fitted each run on markets where the sharp price is known).
+
+`p_center` is the sharp average; `p_min` is the lowest estimate of all. A price is a good bet only if:
+
+1. both sharps price it (`--min-sharps 2`),
+2. the sharps agree within 3 percentage points,
+3. a crowd estimate exists (≥ 3 other soft books),
+4. **worst-case EV = p_min × odds − 1 ≥ 1%** (`--min-ev`),
+5. EV at `p_center` ≤ 20% (bigger is almost always a mapping error or stale price).
+
+**Stake** = bankroll × ½ × full-Kelly fraction **at p_min**, then capped at 2.5% of bankroll per bet, 5% per event (correlated bets on one match share the cap) and 20% per run (`--kelly`, `--max-stake`, `--max-event`, `--max-total`). Arbs use soft books only (Pinnacle doesn't take Australian customers; Betfair midpoints aren't bettable prices).
+
+The output shows each estimate as fair odds (Pin / BF / Crowd / Worst), EV at worst and at centre, and marks capped stakes with `^`. Rejected prices list which estimate failed them.
+
+## Logs (for judging strategies)
+
+`<sport>/logs/bets.csv`: one row per good bet per run, with odds, Pinnacle / Betfair / crowd probabilities, `p_min` and which estimate set it, worst-case and central EV, capped and uncapped stake, and the full strategy string. If the columns change, the old file is kept as `bets.until-<date>.csv` and a new one is started. The same bet found on several runs repeats with the same `bet_key`: dedupe on it (keep the first) to count each bet once at the price you'd have taken. `result`, `closing_fair_odds` and `pnl` are blank, to be filled by a settlement step. `arbs.csv` holds arb legs, and `runs.csv` has one row per run (books that worked, market counts, crowd-model fit).
+
+## Layout
+
+```
+scrapers/      one module per book + registry.py (parallel fetch, failure isolation)
+engine/        odds maths, crowd model, evaluation, logger, terminal report (sport-agnostic)
+soccer/        mappings.py (TEAMS, league patterns, market names), compare.py (matching), run.py, logs/
+tennis/        mappings.py (tours, PLAYERS), compare.py (player matching), run.py, logs/
 ```
 
-- Without `--event-cards` you get only each event's main market (H2H / Match Result) plus outright markets.
-- `--event-cards` fetches every market per match (one request per event); `--core-only` trims to full-game H2H / line / totals, matched by market name (`CORE_MARKET_NAME` in `scrapers/ladbrokes.py`; extend it for new sports).
-- Lines are per outcome: Entain stores a two-way handicap from the away side, the scraper flips it for the home side.
+## Books
 
-### Pinnacle (sharp reference)
+| Book | Role | Method | Notes |
+|---|---|---|---|
+| Pinnacle | sharp | keyless guest API | soccer totals include alternate lines (marked `*`) |
+| Betfair Exchange | sharp | anonymous read-only exchange API | delayed prices; midpoint of best back/lay |
+| Ladbrokes (= Neds) | soft | Entain REST API | soccer fetches each match's markets (slowest book, ~60 s) |
+| Unibet | soft | Kambi feed via unibet.com.au | soccer by league path (sport-wide view is truncated) |
+| Sportsbet | soft | site JSON API | 1X2 + Over/Under 2.5; tennis match betting |
+| PointsBet | soft | public API | match result only |
+| Betr (= BlueBet, TopSport) | soft | BlueBet API | one request per sport |
+| BetRight | soft | site API | match result only |
+| Palmerbet | soft | fixture API | match result only |
 
-Reads the keyless guest API behind pinnacle.com (two requests per sport, all leagues).
+Not implemented (details in `scrapers/registry.py`): TAB/TABtouch (Akamai bot filter), bet365 (Cloudflare challenge), Polymarket (blocked in Australia), Dabble, PlayUp and Picklebet (no API found without a browser), and the racing-focused white-label clusters. No bot-protection workarounds are used.
 
-```bash
-.venv/bin/python -m scrapers.pinnacle --list-sports
-.venv/bin/python -m scrapers.pinnacle --list-leagues soccer
-.venv/bin/python -m scrapers.pinnacle basketball -l NBA --core-only
-.venv/bin/python -m scrapers.pinnacle soccer -l "England - Premier League"
-.venv/bin/python -m scrapers.pinnacle hockey --alternates --periods 0 1
-```
+## Conventions
 
-- `-l` matches a league name exactly if one exists, otherwise by substring (so use full names like `"England - Premier League"`).
-- Defaults: full-game period only, main lines only. `--alternates` adds alt spreads/totals; `--core-only` drops team totals.
-- American odds are converted to decimal; spread `line` is already per side.
-
-### European soccer leagues (all books)
-
-Core markets for 15 leagues (EPL, Championship, League One; Serie A/B; La Liga/Segunda; Bundesliga/2. Bundesliga; Ligue 1/2; Primeira Liga; Belgian Pro League; Eredivisie; Super Lig) from Pinnacle, Ladbrokes and Unibet, one CSV per league.
-
-```bash
-python -m scrapers.soccer                                   # ~2 min, writes data/soccer/<timestamp>/<league>.csv
-python -m scrapers.soccer --leagues england_premier_league italy_serie_a
-python -m scrapers.soccer --books pinnacle unibet --fast
-```
-
-- League names per book live in `LEAGUES` in `scrapers/soccer.py`. A coverage table is printed at the end; a 0 means no fixtures listed or a name needs fixing.
-- Belgium's Ladbrokes/Unibet names are unverified guesses (no fixtures were listed when this was written).
-- Books list different horizons: Pinnacle and Unibet often show the next two rounds, Ladbrokes fewer.
-
-## Soccer +EV / arbitrage finder (`soccer/`)
-
-Scrapes the 15 soccer leagues, matches games across books, and prints +EV bets (soft price vs devigged Pinnacle) and arbs with fractional-Kelly stakes.
-
-```bash
-python -m soccer.run                                  # scrape (~2 min) + analyse, $100 bankroll at half Kelly
-python -m soccer.run --save                           # also keep the CSVs in data/soccer/<timestamp>/
-python -m soccer.run --from-dir data/soccer/<ts>      # re-analyse saved CSVs without scraping
-python -m soccer.run --min-ev 0.01 --bankroll 500 --kelly 0.25 --devig multiplicative
-```
-
-- `soccer/mappings.py`: `TEAMS` (canonical Pinnacle name -> each book's name) and `MARKETS` (which market names are comparable). Unmapped names print as paste-ready lines.
-- `soccer/compare.py`: matching, devig (power / multiplicative), EV, Kelly, arbs.
-- Compares full-time 1X2 and total goals at identical lines only; prematch, open prices only.
-- Arbs exclude Pinnacle legs by default (it doesn't accept Australian customers); `--arb-include-pinnacle` to override.
-- EV above `--max-ev` (30%) is hidden as a likely mapping/stale-price error.
-
-### Shared conventions
-
-- `sport` is canonicalised to Ladbrokes' enum (`SOCCER`, `AMERICAN_FOOTBALL`, `ICE_HOCKEY`, ...). Note Unibet's "FOOTBALL" is soccer but Pinnacle's "Football" is American football; each scraper maps its own.
-- `market_type` is one of `Match`, `Handicap`, `Over/Under`, `Team Total`, `Other` across all books.
-- Team names are **not** yet normalised across books (NBA happens to match; soccer won't).
+- Every scraper exposes `fetch(sport, competition_filter, **options) -> list[OddsRow]` (schema in `scrapers/common.py`, one row per outcome). Sport packages pass the filter, so "which leagues/tours" lives in one place per sport.
+- Team and player names map to Pinnacle's spelling. Most differences are handled by normalisation; the runners print suggested `TEAMS` / `PLAYERS` entries for the rest, to check and paste in.
+- Individual scrapers can also be run alone for CSVs, e.g. `python -m scrapers.pinnacle basketball -l NBA`, `python -m scrapers.ladbrokes --list-sports`, `python -m scrapers.unibet basketball/nba`.

@@ -26,7 +26,7 @@ import logging
 import time
 from typing import Iterator
 
-from .common import JsonClient, OddsRow, canonical_sport, utc_now_iso, write_csv
+from .common import CompetitionFilter, JsonClient, OddsRow, accept_all, canonical_sport, utc_now_iso, write_csv
 
 log = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ def parse(
         for m in matchups
         if m.get("type") == "matchup"
         and not m.get("parentId")
-        and m.get("units", "Regular") == "Regular"
+        and m.get("units", "Regular") in ("Regular", "Sets")  # tennis main matchups are "Sets"
         and (league_names is None or m["league"]["name"] in league_names)
     }
 
@@ -250,3 +250,38 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+SPORT_NAMES = {"soccer": "Soccer", "tennis": "Tennis"}
+
+
+def fetch(
+    sport: str,
+    competition_filter: CompetitionFilter = accept_all,
+    client: PinnacleClient | None = None,
+    alternates: bool | None = None,
+) -> list[OddsRow]:
+    """Uniform entry point used by scrapers.registry. Full-game core markets;
+    soccer includes alternate totals so soft-book .5 lines have a sharp match."""
+    client = client or PinnacleClient(delay=0.5)
+    sp = _resolve_sport(client.sports(), SPORT_NAMES[sport])
+    matchups, markets = client.matchups(sp["id"]), client.markets(sp["id"])
+    labels: dict[str, str] = {}
+    for m in matchups:
+        lg = m.get("league") or {}
+        if lg.get("name") and lg["name"] not in labels:
+            label = competition_filter(lg["name"], lg.get("group"))
+            labels[lg["name"]] = label or ""
+    wanted = [n for n, label in labels.items() if label]
+    if not wanted:
+        return []
+    rows = list(parse(
+        matchups, markets, utc_now_iso(), leagues=wanted,
+        alternates=(sport == "soccer") if alternates is None else alternates, core_only=True,
+    ))
+    out = []
+    for r in rows:
+        if labels.get(r.league):
+            r.league = labels[r.league]
+            out.append(r)
+    return out

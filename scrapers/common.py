@@ -13,7 +13,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import requests
 
@@ -48,6 +48,7 @@ class OddsRow:
     odds_decimal: float
     status: str            # OPEN / SUSPENDED / ...
     suspended: bool        # market-level suspension flag
+    liquidity: float | None = None  # exchange matched volume (Betfair); None elsewhere
 
 
 FIELDNAMES = [f.name for f in fields(OddsRow)]
@@ -94,6 +95,95 @@ class JsonClient:
 
     def post(self, url: str, json: Any) -> Any:
         return self.request("POST", url, json=json)
+
+
+# Sport pipelines pass scrapers a filter: (competition name, region or None) ->
+# the label to store in OddsRow.league, or None to skip that competition. This
+# keeps "which leagues/tours do we want" in one place per sport, not per book.
+CompetitionFilter = Callable[[str, "str | None"], "str | None"]
+
+
+def accept_all(name: str, region: str | None = None) -> str:
+    return name
+
+
+def market_rows(
+    *,
+    scraped_at: str,
+    bookmaker: str,
+    sport: str,
+    league: str,
+    event_id: Any,
+    home: str | None,
+    away: str | None,
+    start_time: str,
+    market_id: Any,
+    market_type: str,
+    market_name: str,
+    outcomes: Iterable[tuple[Any, str, str | None, float | None, float | None]],
+    event_state: str = "NOT_STARTED",
+    status: str = "OPEN",
+    liquidity: float | None = None,
+) -> list[OddsRow]:
+    """Build the rows for one market. outcomes: (outcome_id, label, selection, odds, line).
+    Outcomes without a usable price are dropped."""
+    rows = []
+    for outcome_id, label, selection, odds, line in outcomes:
+        if not odds or odds <= 1:
+            continue
+        rows.append(OddsRow(
+            scraped_at=scraped_at,
+            bookmaker=bookmaker,
+            sport=sport,
+            league=league,
+            event_id=str(event_id),
+            event_name=f"{home} v {away}" if home and away else "",
+            home_team=home,
+            away_team=away,
+            start_time=start_time,
+            event_state=event_state,
+            market_id=str(market_id),
+            market_type=market_type,
+            market_name=market_name,
+            line=line,
+            outcome_id=str(outcome_id),
+            outcome_label=label,
+            selection=selection,
+            participant=label if selection in ("home", "away") else None,
+            odds_decimal=round(float(odds), 4),
+            status=status,
+            suspended=status != "OPEN",
+            liquidity=liquidity,
+        ))
+    return rows
+
+
+def side_of(name: str, home: str | None, away: str | None) -> str | None:
+    """'home' / 'away' / 'draw' for an outcome label in a head-to-head market."""
+    n = name.strip().lower()
+    if n in ("draw", "the draw", "x", "tie"):
+        return "draw"
+    if home and n == home.strip().lower():
+        return "home"
+    if away and n == away.strip().lower():
+        return "away"
+    return None
+
+
+def split_teams(event_name: str) -> tuple[str | None, str | None]:
+    for sep in (" v ", " vs ", " - ", " @ "):
+        if sep in event_name:
+            home, away = event_name.split(sep, 1)
+            return (away.strip(), home.strip()) if sep == " @ " else (home.strip(), away.strip())
+    return None, None
+
+
+def iso_utc(value: Any) -> str:
+    """Epoch seconds / ms or ISO string -> ISO-8601 UTC."""
+    if isinstance(value, (int, float)):
+        ts = value / 1000 if value > 1e11 else value
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
+    return str(value).replace(".0000000Z", "Z")
 
 
 def canonical_sport(name: str, aliases: dict[str, str] | None = None) -> str:

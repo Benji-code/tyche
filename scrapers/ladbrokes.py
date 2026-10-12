@@ -30,7 +30,7 @@ import time
 from collections import Counter
 from typing import Iterator
 
-from .common import JsonClient, OddsRow, utc_now_iso, write_csv
+from .common import CompetitionFilter, JsonClient, OddsRow, accept_all, utc_now_iso, write_csv
 
 log = logging.getLogger(__name__)
 
@@ -307,3 +307,40 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def fetch(
+    sport: str,
+    competition_filter: CompetitionFilter = accept_all,
+    client: EntainClient | None = None,
+    event_cards: bool | None = None,
+) -> list[OddsRow]:
+    """Uniform entry point used by scrapers.registry. Soccer fetches every
+    match's event card (for totals); tennis uses the listing's Head To Head."""
+    client = client or EntainClient("ladbrokes", delay=0.5)
+    cat = _resolve_sport(client.categories(), sport)
+    listing = client.event_request(cat["id"])
+    labels: dict[str, str] = {}
+    for eid, e in (listing.get("events") or {}).items():
+        comp = e.get("competition") or {}
+        label = competition_filter(comp.get("name", ""), comp.get("region"))
+        if label:
+            labels[eid] = label
+
+    if (sport == "soccer") if event_cards is None else event_cards:
+        payloads = [client.event_card(eid) for eid in labels
+                    if len(listing["events"][eid].get("participant_ids") or []) == 2]
+    else:
+        listing["events"] = {eid: listing["events"][eid] for eid in labels}
+        payloads = [listing]
+
+    scraped_at = utc_now_iso()
+    rows: list[OddsRow] = []
+    seen: set[str] = set()
+    for payload in payloads:
+        for row in parse(payload, f"{client.brand}_au", cat["category"], scraped_at, core_only=True):
+            if row.event_id in labels and row.outcome_id not in seen:
+                seen.add(row.outcome_id)
+                row.league = labels[row.event_id]
+                rows.append(row)
+    return rows
